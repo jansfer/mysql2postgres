@@ -1,6 +1,7 @@
 import argparse
 import configparser
 import sys
+import time
 import mysql.connector
 import psycopg2
 from psycopg2 import extras
@@ -93,9 +94,17 @@ def map_mysql_to_postgres_type(mysql_type):
     return 'TEXT'
 
 
-def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate):
+def format_time(seconds):
+    """Formats seconds into a human-readable string (MM:SS)."""
+    if seconds is None or seconds < 0:
+        return "N/A"
+    minutes = int(seconds // 60)
+    seconds = int(seconds % 60)
+    return f"{minutes:02d}m {seconds:02d}s"
+
+def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, current_index, total_tables):
     """Migrates a single table from MySQL to PostgreSQL."""
-    print(f"\n----- Processing table: {table_name} ----- ")
+    print(f"\n----- Processing table: {table_name} ({current_index}/{total_tables}) -----")
     with my_conn.cursor() as my_cursor, pg_conn.cursor() as pg_cursor:
         # 1. Get MySQL table schema
         my_cursor.execute(f"DESCRIBE `{table_name}`")
@@ -121,7 +130,7 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate):
                 nullable = "NULL" if col[2] == 'YES' else "NOT NULL"
                 column_defs.append(f'"{col_name}" {pg_type} {nullable}')
             
-            create_sql = f'CREATE TABLE "{table_name}" ({', '.join(column_defs)})'
+            create_sql = f'CREATE TABLE "{table_name}" ({", ".join(column_defs)})'
             pg_cursor.execute(create_sql)
             print("Table created successfully.")
         elif truncate:
@@ -139,22 +148,35 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate):
         print(f"Starting data migration for {total_rows} records...")
         migrated_rows = 0
         offset = 0
+        time_remaining_str = "Calculating..."
 
         column_names = [col[0] for col in columns_schema]
-        insert_sql = f'INSERT INTO "{table_name}" ({', '.join([f'"{c}"' for c in column_names])}) VALUES %s'
+        insert_sql = f'INSERT INTO "{table_name}" ({", ".join([f'"{c}"' for c in column_names])}) VALUES %s'
 
         while offset < total_rows:
+            start_time = time.time()
             my_cursor.execute(f"SELECT * FROM `{table_name}` LIMIT %s OFFSET %s", (chunk_size, offset))
             rows_chunk = my_cursor.fetchall()
             if not rows_chunk:
                 break
             
             extras.execute_values(pg_cursor, insert_sql, rows_chunk)
-
+            
+            chunk_time = time.time() - start_time
             migrated_rows += len(rows_chunk)
             offset += chunk_size
+            
+            if chunk_time > 0:
+                rows_per_second = len(rows_chunk) / chunk_time
+                rows_remaining = total_rows - migrated_rows
+                if rows_per_second > 0:
+                    time_remaining_seconds = rows_remaining / rows_per_second
+                    time_remaining_str = format_time(time_remaining_seconds)
+                else:
+                    time_remaining_str = "Infinite"
+
             progress = (migrated_rows / total_rows) * 100
-            sys.stdout.write(f"\rProgress: {migrated_rows}/{total_rows} records migrated ({progress:.2f}%)")
+            sys.stdout.write(f"\rProgress: {migrated_rows}/{total_rows} ({progress:.2f}%) | ETR: {time_remaining_str}   ")
             sys.stdout.flush()
 
         print("\nData migration completed for this table.")
@@ -237,14 +259,17 @@ def main():
     # --- End Confirmation Step ---
 
     try:
-        for table_name in source_tables:
+        total_tables = len(source_tables)
+        for i, table_name in enumerate(source_tables, 1):
             migrate_table(
                 table_name, 
                 my_conn, 
                 pg_conn, 
                 args.chunk_size,
                 args.recreate,
-                args.truncate
+                args.truncate,
+                current_index=i,
+                total_tables=total_tables
             )
         print("\nMigration finished for all tables.")
     except (mysql.connector.Error, psycopg2.Error) as err:
