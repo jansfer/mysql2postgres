@@ -195,6 +195,47 @@ def main():
             print(f"  - {table}")
     print("----------------------------------")
 
+    # --- Add Confirmation Step ---
+    print("\n--- Summary of Planned Actions ---")
+    actions = []
+    if missing_in_target:
+        actions.append(f"  - CREATE {len(missing_in_target)} new table(s) in the target database.")
+    
+    if args.recreate and existing_in_target:
+        actions.append(f"  - DROP and RECREATE {len(existing_in_target)} existing table(s) in the target database.")
+    elif args.truncate and existing_in_target:
+        actions.append(f"  - TRUNCATE {len(existing_in_target)} existing table(s) in the target database.")
+    
+    if not source_tables:
+        print("No source tables found. Nothing to do.")
+        return
+
+    if not actions:
+        print("No schema changes required. Data will be migrated into existing tables.")
+    else:
+        for action in actions:
+            print(action)
+
+    print(f"  - MIGRATE data for up to {len(source_tables)} table(s).")
+    
+    if args.recreate:
+        print("\n\033[91mWARNING: The --recreate flag will cause IRREVERSIBLE DATA LOSS in target tables.\033[0m")
+    elif args.truncate:
+        print("\n\033[93mWARNING: The --truncate flag will delete all data from existing target tables.\033[0m")
+
+    try:
+        confirm = input("\n> Do you want to proceed? (y/n): ")
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
+        sys.exit(1)
+
+    if confirm.lower() != 'y':
+        print("Operation cancelled by user.")
+        sys.exit(0)
+    
+    print("----------------------------------")
+    # --- End Confirmation Step ---
+
     try:
         for table_name in source_tables:
             migrate_table(
