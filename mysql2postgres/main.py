@@ -240,80 +240,84 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
 
 def main():
     """Main function to orchestrate the migration process."""
+    overall_start_time = time.time()
     args = parse_arguments()
     config = load_config(args.config)
     
-    my_conn = connect_mysql(config['mysql'])
-    pg_conn = connect_postgres(config['postgresql'])
+    my_conn = None
+    pg_conn = None
     
-    source_tables = get_mysql_tables(my_conn)
-    target_tables = get_postgres_tables(pg_conn)
-    
-    print("--- Database Schema Comparison ---")
-    print(f"Found {len(source_tables)} tables in the source MySQL database.")
-    
-    existing_in_target = []
-    missing_in_target = []
+    try:
+        my_conn = connect_mysql(config['mysql'])
+        pg_conn = connect_postgres(config['postgresql'])
+        
+        source_tables = get_mysql_tables(my_conn)
+        target_tables = get_postgres_tables(pg_conn)
+        
+        print("--- Database Schema Comparison ---")
+        print(f"Found {len(source_tables)} tables in the source MySQL database.")
+        
+        existing_in_target = []
+        missing_in_target = []
 
-    for table in source_tables:
-        if table in target_tables:
-            existing_in_target.append(table)
+        for table in source_tables:
+            if table in target_tables:
+                existing_in_target.append(table)
+            else:
+                missing_in_target.append(table)
+        
+        if existing_in_target:
+            print("\nTables that already exist in the target PostgreSQL database:")
+            for table in existing_in_target:
+                print(f"  - {table}")
+        
+        if missing_in_target:
+            print("\nTables that are missing in the target PostgreSQL database:")
+            for table in missing_in_target:
+                print(f"  - {table}")
+        print("----------------------------------")
+
+        # --- Add Confirmation Step ---
+        print("\n--- Summary of Planned Actions ---")
+        actions = []
+        if missing_in_target:
+            actions.append(f"  - CREATE {len(missing_in_target)} new table(s) in the target database.")
+        
+        if args.recreate and existing_in_target:
+            actions.append(f"  - DROP and RECREATE {len(existing_in_target)} existing table(s) in the target database.")
+        elif args.truncate and existing_in_target:
+            actions.append(f"  - TRUNCATE {len(existing_in_target)} existing table(s) in the target database.")
+        
+        if not source_tables:
+            print("No source tables found. Nothing to do.")
+            return
+
+        if not actions:
+            print("No schema changes required. Data will be migrated into existing tables.")
         else:
-            missing_in_target.append(table)
-    
-    if existing_in_target:
-        print("\nTables that already exist in the target PostgreSQL database:")
-        for table in existing_in_target:
-            print(f"  - {table}")
-    
-    if missing_in_target:
-        print("\nTables that are missing in the target PostgreSQL database:")
-        for table in missing_in_target:
-            print(f"  - {table}")
-    print("----------------------------------")
+            for action in actions:
+                print(action)
 
-    # --- Add Confirmation Step ---
-    print("\n--- Summary of Planned Actions ---")
-    actions = []
-    if missing_in_target:
-        actions.append(f"  - CREATE {len(missing_in_target)} new table(s) in the target database.")
-    
-    if args.recreate and existing_in_target:
-        actions.append(f"  - DROP and RECREATE {len(existing_in_target)} existing table(s) in the target database.")
-    elif args.truncate and existing_in_target:
-        actions.append(f"  - TRUNCATE {len(existing_in_target)} existing table(s) in the target database.")
-    
-    if not source_tables:
-        print("No source tables found. Nothing to do.")
-        return
+        print(f"  - MIGRATE data for up to {len(source_tables)} table(s).")
+        
+        if args.recreate:
+            print("\n\033[91mWARNING: The --recreate flag will cause IRREVERSIBLE DATA LOSS in target tables.\033[0m")
+        elif args.truncate:
+            print("\n\033[93mWARNING: The --truncate flag will delete all data from existing target tables.\033[0m")
 
-    if not actions:
-        print("No schema changes required. Data will be migrated into existing tables.")
-    else:
-        for action in actions:
-            print(action)
+        try:
+            confirm = input("\n> Do you want to proceed? (y/n): ")
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user.")
+            sys.exit(1)
 
-    print(f"  - MIGRATE data for up to {len(source_tables)} table(s).")
-    
-    if args.recreate:
-        print("\n\033[91mWARNING: The --recreate flag will cause IRREVERSIBLE DATA LOSS in target tables.\033[0m")
-    elif args.truncate:
-        print("\n\033[93mWARNING: The --truncate flag will delete all data from existing target tables.\033[0m")
+        if confirm.lower() != 'y':
+            print("Operation cancelled by user.")
+            sys.exit(0)
+        
+        print("----------------------------------")
+        # --- End Confirmation Step ---
 
-    try:
-        confirm = input("\n> Do you want to proceed? (y/n): ")
-    except KeyboardInterrupt:
-        print("\nOperation cancelled by user.")
-        sys.exit(1)
-
-    if confirm.lower() != 'y':
-        print("Operation cancelled by user.")
-        sys.exit(0)
-    
-    print("----------------------------------")
-    # --- End Confirmation Step ---
-
-    try:
         total_tables = len(source_tables)
         for i, table_name in enumerate(source_tables, 1):
             migrate_table(
@@ -329,11 +333,18 @@ def main():
         print("\nMigration finished for all tables.")
     except (mysql.connector.Error, psycopg2.Error) as err:
         print(f"\nAn error occurred during migration: {err}")
-        pg_conn.rollback()
+        if pg_conn:
+            pg_conn.rollback()
     finally:
-        my_conn.close()
-        pg_conn.close()
+        if my_conn:
+            my_conn.close()
+        if pg_conn:
+            pg_conn.close()
         print("Database connections closed.")
+        
+        overall_end_time = time.time()
+        total_duration = overall_end_time - overall_start_time
+        print(f"Total execution time: {format_time(total_duration)}")
 
 if __name__ == "__main__":
     main()
