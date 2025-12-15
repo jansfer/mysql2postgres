@@ -106,9 +106,18 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
     """Migrates a single table from MySQL to PostgreSQL."""
     print(f"\n----- Processing table: {table_name} ({current_index}/{total_tables}) -----")
     with my_conn.cursor() as my_cursor, pg_conn.cursor() as pg_cursor:
-        # 1. Get MySQL table schema
+        # 1. Get MySQL table schema and find primary key
         my_cursor.execute(f"DESCRIBE `{table_name}`")
         columns_schema = my_cursor.fetchall()
+        
+        primary_key_column = None
+        pk_candidates = []
+        for col in columns_schema:
+            if col[3] == b'PRI':
+                pk_candidates.append(col[0])
+        
+        if len(pk_candidates) == 1:
+            primary_key_column = pk_candidates[0]
 
         # 2. Handle table existence in PostgreSQL
         pg_cursor.execute("SELECT to_regclass(%s)", (f"public.{table_name}",))
@@ -119,7 +128,6 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
             pg_cursor.execute(f'DROP TABLE "{table_name}" CASCADE')
             table_exists = False
         
-        # 3. Create table in PostgreSQL if it doesn't exist
         if not table_exists:
             print(f"Creating table '{table_name}' in PostgreSQL.")
             column_defs = []
@@ -147,37 +155,83 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
 
         print(f"Starting data migration for {total_rows} records...")
         migrated_rows = 0
-        offset = 0
         time_remaining_str = "Calculating..."
 
         column_names = [col[0] for col in columns_schema]
         insert_sql = f'INSERT INTO "{table_name}" ({", ".join([f'"{c}"' for c in column_names])}) VALUES %s'
+        
+        # --- Choose Pagination Strategy ---
+        if primary_key_column:
+            # Keyset Pagination (more efficient)
+            print(f"Using efficient keyset pagination on primary key: '{primary_key_column}'")
+            last_id = 0
+            while True:
+                start_time = time.time()
+                query = f"SELECT * FROM `{table_name}` WHERE `{primary_key_column}` > %s ORDER BY `{primary_key_column}` ASC LIMIT %s"
+                my_cursor.execute(query, (last_id, chunk_size))
+                rows_chunk = my_cursor.fetchall()
 
-        while offset < total_rows:
-            start_time = time.time()
-            my_cursor.execute(f"SELECT * FROM `{table_name}` LIMIT %s OFFSET %s", (chunk_size, offset))
-            rows_chunk = my_cursor.fetchall()
-            if not rows_chunk:
-                break
-            
-            extras.execute_values(pg_cursor, insert_sql, rows_chunk)
-            
-            chunk_time = time.time() - start_time
-            migrated_rows += len(rows_chunk)
-            offset += chunk_size
-            
-            if chunk_time > 0:
-                rows_per_second = len(rows_chunk) / chunk_time
-                rows_remaining = total_rows - migrated_rows
-                if rows_per_second > 0:
-                    time_remaining_seconds = rows_remaining / rows_per_second
-                    time_remaining_str = format_time(time_remaining_seconds)
-                else:
-                    time_remaining_str = "Infinite"
+                if not rows_chunk:
+                    break
+                
+                # Sanitize data to remove NUL bytes
+                sanitized_rows = [tuple(c.replace('\x00', '') if isinstance(c, str) else c for c in row) for row in rows_chunk]
 
-            progress = (migrated_rows / total_rows) * 100
-            sys.stdout.write(f"\rProgress: {migrated_rows}/{total_rows} ({progress:.2f}%) | ETR: {time_remaining_str}   ")
-            sys.stdout.flush()
+                extras.execute_values(pg_cursor, insert_sql, sanitized_rows)
+                
+                chunk_time = time.time() - start_time
+                migrated_rows += len(rows_chunk)
+                last_id = rows_chunk[-1][column_names.index(primary_key_column)]
+
+                if chunk_time > 0:
+                    rows_per_second = len(rows_chunk) / chunk_time
+                    rows_remaining = total_rows - migrated_rows
+                    if rows_per_second > 0:
+                        time_remaining_seconds = rows_remaining / rows_per_second
+                        time_remaining_str = format_time(time_remaining_seconds)
+                    else:
+                        time_remaining_str = "Infinite"
+                
+                progress = (migrated_rows / total_rows) * 100
+                sys.stdout.write(f"\rProgress: {migrated_rows}/{total_rows} ({progress:.2f}%) | ETR: {time_remaining_str}   ")
+                sys.stdout.flush()
+
+        else:
+            # Offset Pagination (fallback)
+            if len(pk_candidates) > 1:
+                print("Warning: Composite primary key detected. Falling back to less efficient OFFSET pagination.")
+            else:
+                print("Warning: No single primary key found. Falling back to less efficient OFFSET pagination.")
+            
+            offset = 0
+            while offset < total_rows:
+                start_time = time.time()
+                my_cursor.execute(f"SELECT * FROM `{table_name}` LIMIT %s OFFSET %s", (chunk_size, offset))
+                rows_chunk = my_cursor.fetchall()
+                if not rows_chunk:
+                    break
+                
+                # Sanitize data to remove NUL bytes
+                sanitized_rows = [tuple(c.replace('\x00', '') if isinstance(c, str) else c for c in row) for row in rows_chunk]
+
+                extras.execute_values(pg_cursor, insert_sql, sanitized_rows)
+                
+                chunk_time = time.time() - start_time
+                migrated_rows += len(rows_chunk)
+                offset += chunk_size
+                
+                if chunk_time > 0:
+                    rows_per_second = len(rows_chunk) / chunk_time
+                    rows_remaining = total_rows - migrated_rows
+                    if rows_per_second > 0:
+                        time_remaining_seconds = rows_remaining / rows_per_second
+                        time_remaining_str = format_time(time_remaining_seconds)
+                    else:
+                        time_remaining_str = "Infinite"
+
+                progress = (migrated_rows / total_rows) * 100
+                sys.stdout.write(f"\rProgress: {migrated_rows}/{total_rows} ({progress:.2f}%) | ETR: {time_remaining_str}   ")
+                sys.stdout.flush()
 
         print("\nData migration completed for this table.")
         pg_conn.commit()
