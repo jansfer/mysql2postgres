@@ -113,7 +113,8 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         primary_key_column = None
         pk_candidates = []
         for col in columns_schema:
-            if col[3] == b'PRI':
+            # Check for 'PRI' in both bytes and string form for robustness
+            if col[3] in (b'PRI', 'PRI'):
                 pk_candidates.append(col[0])
         
         if len(pk_candidates) == 1:
