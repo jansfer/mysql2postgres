@@ -103,7 +103,7 @@ def format_time(seconds):
     return f"{minutes:02d}m {seconds:02d}s"
 
 def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, current_index, total_tables):
-    """Migrates a single table from MySQL to PostgreSQL."""
+    """Migrates a single table from MySQL to PostgreSQL, including indexes."""
     print(f"\n----- Processing table: {table_name} ({current_index}/{total_tables}) -----")
     with my_conn.cursor() as my_cursor, pg_conn.cursor() as pg_cursor:
         # 1. Get MySQL table schema and find primary key
@@ -113,7 +113,6 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         primary_key_column = None
         pk_candidates = []
         for col in columns_schema:
-            # Check for 'PRI' in both bytes and string form for robustness
             if col[3] in (b'PRI', 'PRI'):
                 pk_candidates.append(col[0])
         
@@ -137,11 +136,51 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 col_type = col[1].decode('utf-8') if isinstance(col[1], bytearray) else col[1]
                 pg_type = map_mysql_to_postgres_type(col_type)
                 nullable = "NULL" if col[2] == 'YES' else "NOT NULL"
-                column_defs.append(f'"{col_name}" {pg_type} {nullable}')
+                
+                pk_constraint = ""
+                if col_name == primary_key_column:
+                    pk_constraint = " PRIMARY KEY"
+
+                column_defs.append(f'"{col_name}" {pg_type} {nullable}{pk_constraint}')
             
             create_sql = f'CREATE TABLE "{table_name}" ({", ".join(column_defs)})'
             pg_cursor.execute(create_sql)
             print("Table created successfully.")
+
+            # --- Migrate Indexes ---
+            print("Migrating indexes...")
+            my_cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+            mysql_indexes = my_cursor.fetchall()
+            
+            indexes_to_create = {}
+            for index_row in mysql_indexes:
+                key_name = index_row[2]
+                if key_name == 'PRIMARY':
+                    continue  # Already handled
+
+                col_name = index_row[4]
+                non_unique = index_row[1]
+                
+                if key_name not in indexes_to_create:
+                    indexes_to_create[key_name] = {'columns': [], 'non_unique': bool(non_unique)}
+                
+                # Store columns in their correct order
+                seq_in_index = index_row[3]
+                indexes_to_create[key_name]['columns'].append((seq_in_index, col_name))
+
+            for index_name, index_data in indexes_to_create.items():
+                # Sort columns by their sequence in the index
+                sorted_columns = [col[1] for col in sorted(index_data['columns'])]
+                columns_sql = '", "'.join(sorted_columns)
+                
+                unique_str = "" if index_data['non_unique'] else "UNIQUE "
+                # Using "IF NOT EXISTS" for safety (requires PostgreSQL 9.5+)
+                index_sql = f'CREATE {unique_str}INDEX IF NOT EXISTS "{index_name}" ON "{table_name}" ("{columns_sql}")'
+                
+                print(f"  - Creating index '{index_name}' on column(s): {', '.join(sorted_columns)}")
+                pg_cursor.execute(index_sql)
+            # --- End Index Migration ---
+
         elif truncate:
             print(f"Truncating table '{table_name}' in PostgreSQL as per --truncate flag.")
             pg_cursor.execute(f'TRUNCATE TABLE "{table_name}" RESTART IDENTITY CASCADE')
@@ -163,7 +202,6 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         
         # --- Choose Pagination Strategy ---
         if primary_key_column:
-            # Keyset Pagination (more efficient)
             print(f"Using efficient keyset pagination on primary key: '{primary_key_column}'")
             last_id = 0
             while True:
@@ -175,9 +213,7 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 if not rows_chunk:
                     break
                 
-                # Sanitize data to remove NUL bytes
                 sanitized_rows = [tuple(c.replace('\x00', '') if isinstance(c, str) else c for c in row) for row in rows_chunk]
-
                 extras.execute_values(pg_cursor, insert_sql, sanitized_rows)
                 
                 chunk_time = time.time() - start_time
@@ -198,7 +234,6 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 sys.stdout.flush()
 
         else:
-            # Offset Pagination (fallback)
             if len(pk_candidates) > 1:
                 print("Warning: Composite primary key detected. Falling back to less efficient OFFSET pagination.")
             else:
@@ -212,9 +247,7 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 if not rows_chunk:
                     break
                 
-                # Sanitize data to remove NUL bytes
                 sanitized_rows = [tuple(c.replace('\x00', '') if isinstance(c, str) else c for c in row) for row in rows_chunk]
-
                 extras.execute_values(pg_cursor, insert_sql, sanitized_rows)
                 
                 chunk_time = time.time() - start_time
