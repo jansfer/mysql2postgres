@@ -69,6 +69,10 @@ def map_mysql_to_postgres_type(mysql_type):
     This is a simplified mapping and might need adjustments for specific needs.
     """
     mysql_type_lower = mysql_type.lower()
+    if 'bigint' in mysql_type_lower:
+        return 'BIGINT'
+    if 'unsigned' in mysql_type_lower and 'int' in mysql_type_lower:
+        return 'BIGINT'
     if 'int' in mysql_type_lower:
         return 'INTEGER'
     if 'varchar' in mysql_type_lower:
@@ -183,42 +187,49 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 print(f"  - Creating index '{index_name}' on column(s): {', '.join(sorted_columns)}")
                 pg_cursor.execute(index_sql)
 
-            # --- Handle FULLTEXT indexes ---
+            # --- Handle ALL FULLTEXT indexes for the table at once ---
             if fulltext_indexes:
                 print("Migrating FULLTEXT indexes to PostgreSQL FTS...")
+
+                # 1. Collect all unique columns from all fulltext indexes
+                all_fulltext_columns = set()
                 for index_name, index_data in fulltext_indexes.items():
-                    sorted_columns = [col[1] for col in sorted(index_data)]
-                    print(f"  - Creating FTS infrastructure for index '{index_name}' on column(s): {', '.join(sorted_columns)}")
+                    for _, col_name in index_data:
+                        all_fulltext_columns.add(col_name)
+                
+                sorted_columns = sorted(list(all_fulltext_columns))
+                
+                print(f"  - Creating FTS infrastructure for column(s): {', '.join(sorted_columns)}")
 
-                    # 1. Create GIN index
-                    gin_index_name = f"{table_name}_{index_name}_gin"
-                    gin_sql = f'CREATE INDEX "{gin_index_name}" ON "{table_name}" USING GIN ("fts_vector")'
-                    print(f"    - Creating GIN index '{gin_index_name}'")
-                    pg_cursor.execute(gin_sql)
+                # 2. Create a single GIN index
+                gin_index_name = f"{table_name}_fts_gin"
+                gin_sql = f'CREATE INDEX "{gin_index_name}" ON "{table_name}" USING GIN ("fts_vector")'
+                print(f"    - Creating GIN index '{gin_index_name}'")
+                pg_cursor.execute(gin_sql)
 
-                    # 2. Create trigger function
-                    trigger_func_name = f"update_{table_name}_fts_vector"
-                    coalesce_cols = " || ' ' || ".join([f"coalesce(NEW.\"{col}\", '')" for col in sorted_columns])
-                    trigger_func_sql = f"""
-                    CREATE OR REPLACE FUNCTION {trigger_func_name}() RETURNS TRIGGER AS $$
-                    BEGIN
-                        NEW.fts_vector := to_tsvector('english', {coalesce_cols});
-                        RETURN NEW;
-                    END
-                    $$ LANGUAGE plpgsql;
-                    """
-                    print(f"    - Creating trigger function '{trigger_func_name}'")
-                    pg_cursor.execute(trigger_func_sql)
+                # 3. Create a single trigger function
+                trigger_func_name = f"update_{table_name}_fts_vector"
+                coalesce_cols = " || ' ' || ".join([f"coalesce(NEW.\"{col}\", '')" for col in sorted_columns])
+                trigger_func_sql = f"""
+                CREATE OR REPLACE FUNCTION {trigger_func_name}() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.fts_vector := to_tsvector('english', {coalesce_cols});
+                    RETURN NEW;
+                END
+                $$ LANGUAGE plpgsql;
+                """
+                print(f"    - Creating trigger function '{trigger_func_name}'")
+                pg_cursor.execute(trigger_func_sql)
 
-                    # 3. Create trigger
-                    trigger_name = f"{table_name}_fts_trigger"
-                    trigger_sql = f"""
-                    CREATE TRIGGER {trigger_name}
-                    BEFORE INSERT OR UPDATE ON "{table_name}"
-                    FOR EACH ROW EXECUTE PROCEDURE {trigger_func_name}();
-                    """
-                    print(f"    - Creating trigger '{trigger_name}'")
-                    pg_cursor.execute(trigger_sql)
+                # 4. Create a single trigger
+                trigger_name = f"{table_name}_fts_trigger"
+                trigger_sql = f"""
+                CREATE TRIGGER {trigger_name}
+                BEFORE INSERT OR UPDATE ON "{table_name}"
+                FOR EACH ROW EXECUTE PROCEDURE {trigger_func_name}();
+                """
+                print(f"    - Creating trigger '{trigger_name}'")
+                pg_cursor.execute(trigger_sql)
             # --- End Index Migration ---
 
         elif truncate:
@@ -314,13 +325,18 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         # --- Populate fts_vector for existing data ---
         if fulltext_indexes:
             print("Populating 'fts_vector' for migrated data...")
+            all_fulltext_columns = set()
             for index_name, index_data in fulltext_indexes.items():
-                sorted_columns = [col[1] for col in sorted(index_data)]
-                coalesce_cols = " || ' ' || ".join([f"coalesce(\"{col}\", '')" for col in sorted_columns])
-                update_sql = f"UPDATE \"{table_name}\" SET fts_vector = to_tsvector('english', {coalesce_cols});"
-                print(f"  - Populating FTS data for index '{index_name}'...")
-                pg_cursor.execute(update_sql)
-                print("  - FTS data populated.")
+                for _, col_name in index_data:
+                    all_fulltext_columns.add(col_name)
+            
+            sorted_columns = sorted(list(all_fulltext_columns))
+
+            coalesce_cols = " || ' ' || ".join([f"coalesce(\"{col}\", '')" for col in sorted_columns])
+            update_sql = f"UPDATE \"{table_name}\" SET fts_vector = to_tsvector('english', {coalesce_cols});"
+            print(f"  - Populating FTS data for columns: {', '.join(sorted_columns)}...")
+            pg_cursor.execute(update_sql)
+            print("  - FTS data populated.")
 
         pg_conn.commit()
 
