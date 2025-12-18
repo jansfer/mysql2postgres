@@ -62,6 +62,7 @@ Before running the tool, you must provide your database connection details.
     user = your_mysql_user
     password = your_mysql_password
     database = source_database_name
+    port = 3306
 
     [postgresql]
     host = localhost

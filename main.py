@@ -110,14 +110,47 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         my_cursor.execute(f"DESCRIBE `{table_name}`")
         columns_schema = my_cursor.fetchall()
         
-        primary_key_column = None
-        pk_candidates = []
+        column_defs = []
         for col in columns_schema:
+            col_name = col[0]
+            col_type = col[1].decode('utf-8') if isinstance(col[1], bytearray) else col[1]
+            pg_type = map_mysql_to_postgres_type(col_type)
+            nullable = "NULL" if col[2] == 'YES' else "NOT NULL"
+            pk_constraint = ""
             if col[3] in (b'PRI', 'PRI'):
-                pk_candidates.append(col[0])
-        
+                pk_constraint = " PRIMARY KEY"
+            column_defs.append(f'"{col_name}" {pg_type} {nullable}{pk_constraint}')
+
+        primary_key_column = None
+        pk_candidates = [col[0] for col in columns_schema if col[3] in (b'PRI', 'PRI')]
         if len(pk_candidates) == 1:
             primary_key_column = pk_candidates[0]
+
+        # --- Get All Index Info ---
+        my_cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+        mysql_indexes = my_cursor.fetchall()
+        indexes_to_create = {}
+        fulltext_indexes = {}
+        for index_row in mysql_indexes:
+            key_name = index_row[2]
+            if key_name == 'PRIMARY':
+                continue
+
+            index_type = index_row[10]
+            if index_type == 'FULLTEXT':
+                if key_name not in fulltext_indexes:
+                    fulltext_indexes[key_name] = []
+                seq_in_index = index_row[3]
+                col_name = index_row[4]
+                fulltext_indexes[key_name].append((seq_in_index, col_name))
+                continue
+
+            col_name = index_row[4]
+            non_unique = index_row[1]
+            if key_name not in indexes_to_create:
+                indexes_to_create[key_name] = {'columns': [], 'non_unique': bool(non_unique)}
+            seq_in_index = index_row[3]
+            indexes_to_create[key_name]['columns'].append((seq_in_index, col_name))
 
         # 2. Handle table existence in PostgreSQL
         pg_cursor.execute("SELECT to_regclass(%s)", (f"public.{table_name}",))
@@ -130,55 +163,62 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         
         if not table_exists:
             print(f"Creating table '{table_name}' in PostgreSQL.")
-            column_defs = []
-            for col in columns_schema:
-                col_name = col[0]
-                col_type = col[1].decode('utf-8') if isinstance(col[1], bytearray) else col[1]
-                pg_type = map_mysql_to_postgres_type(col_type)
-                nullable = "NULL" if col[2] == 'YES' else "NOT NULL"
-                
-                pk_constraint = ""
-                if col_name == primary_key_column:
-                    pk_constraint = " PRIMARY KEY"
-
-                column_defs.append(f'"{col_name}" {pg_type} {nullable}{pk_constraint}')
             
+            if fulltext_indexes:
+                # Check if fts_vector column already exists to avoid duplication
+                if not any('"fts_vector"' in s for s in column_defs):
+                    column_defs.append('"fts_vector" tsvector')
+
             create_sql = f'CREATE TABLE "{table_name}" ({", ".join(column_defs)})'
             pg_cursor.execute(create_sql)
             print("Table created successfully.")
 
-            # --- Migrate Indexes ---
-            print("Migrating indexes...")
-            my_cursor.execute(f"SHOW INDEX FROM `{table_name}`")
-            mysql_indexes = my_cursor.fetchall()
-            
-            indexes_to_create = {}
-            for index_row in mysql_indexes:
-                key_name = index_row[2]
-                if key_name == 'PRIMARY':
-                    continue  # Already handled
-
-                col_name = index_row[4]
-                non_unique = index_row[1]
-                
-                if key_name not in indexes_to_create:
-                    indexes_to_create[key_name] = {'columns': [], 'non_unique': bool(non_unique)}
-                
-                # Store columns in their correct order
-                seq_in_index = index_row[3]
-                indexes_to_create[key_name]['columns'].append((seq_in_index, col_name))
-
+            # --- Create Standard Indexes ---
+            print("Migrating standard indexes...")
             for index_name, index_data in indexes_to_create.items():
-                # Sort columns by their sequence in the index
                 sorted_columns = [col[1] for col in sorted(index_data['columns'])]
                 columns_sql = '", "'.join(sorted_columns)
-                
                 unique_str = "" if index_data['non_unique'] else "UNIQUE "
-                # Using "IF NOT EXISTS" for safety (requires PostgreSQL 9.5+)
                 index_sql = f'CREATE {unique_str}INDEX IF NOT EXISTS "{index_name}" ON "{table_name}" ("{columns_sql}")'
-                
                 print(f"  - Creating index '{index_name}' on column(s): {', '.join(sorted_columns)}")
                 pg_cursor.execute(index_sql)
+
+            # --- Handle FULLTEXT indexes ---
+            if fulltext_indexes:
+                print("Migrating FULLTEXT indexes to PostgreSQL FTS...")
+                for index_name, index_data in fulltext_indexes.items():
+                    sorted_columns = [col[1] for col in sorted(index_data)]
+                    print(f"  - Creating FTS infrastructure for index '{index_name}' on column(s): {', '.join(sorted_columns)}")
+
+                    # 1. Create GIN index
+                    gin_index_name = f"{table_name}_{index_name}_gin"
+                    gin_sql = f'CREATE INDEX "{gin_index_name}" ON "{table_name}" USING GIN ("fts_vector")'
+                    print(f"    - Creating GIN index '{gin_index_name}'")
+                    pg_cursor.execute(gin_sql)
+
+                    # 2. Create trigger function
+                    trigger_func_name = f"update_{table_name}_fts_vector"
+                    coalesce_cols = " || ' ' || ".join([f"coalesce(NEW.\"{col}\", '')" for col in sorted_columns])
+                    trigger_func_sql = f"""
+                    CREATE OR REPLACE FUNCTION {trigger_func_name}() RETURNS TRIGGER AS $$
+                    BEGIN
+                        NEW.fts_vector := to_tsvector('english', {coalesce_cols});
+                        RETURN NEW;
+                    END
+                    $$ LANGUAGE plpgsql;
+                    """
+                    print(f"    - Creating trigger function '{trigger_func_name}'")
+                    pg_cursor.execute(trigger_func_sql)
+
+                    # 3. Create trigger
+                    trigger_name = f"{table_name}_fts_trigger"
+                    trigger_sql = f"""
+                    CREATE TRIGGER {trigger_name}
+                    BEFORE INSERT OR UPDATE ON "{table_name}"
+                    FOR EACH ROW EXECUTE PROCEDURE {trigger_func_name}();
+                    """
+                    print(f"    - Creating trigger '{trigger_name}'")
+                    pg_cursor.execute(trigger_sql)
             # --- End Index Migration ---
 
         elif truncate:
@@ -191,6 +231,8 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
         
         if total_rows == 0:
             print("Table is empty. No data to migrate.")
+            if fulltext_indexes:
+                pg_conn.commit()
             return
 
         print(f"Starting data migration for {total_rows} records...")
@@ -268,6 +310,18 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 sys.stdout.flush()
 
         print("\nData migration completed for this table.")
+
+        # --- Populate fts_vector for existing data ---
+        if fulltext_indexes:
+            print("Populating 'fts_vector' for migrated data...")
+            for index_name, index_data in fulltext_indexes.items():
+                sorted_columns = [col[1] for col in sorted(index_data)]
+                coalesce_cols = " || ' ' || ".join([f"coalesce(\"{col}\", '')" for col in sorted_columns])
+                update_sql = f"UPDATE \"{table_name}\" SET fts_vector = to_tsvector('english', {coalesce_cols});"
+                print(f"  - Populating FTS data for index '{index_name}'...")
+                pg_cursor.execute(update_sql)
+                print("  - FTS data populated.")
+
         pg_conn.commit()
 
 
