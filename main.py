@@ -110,25 +110,26 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
     """Migrates a single table from MySQL to PostgreSQL, including indexes."""
     print(f"\n----- Processing table: {table_name} ({current_index}/{total_tables}) -----")
     with my_conn.cursor() as my_cursor, pg_conn.cursor() as pg_cursor:
-        # 1. Get MySQL table schema and find primary key
+        # 1. Get MySQL table schema and identify primary key columns
         my_cursor.execute(f"DESCRIBE `{table_name}`")
         columns_schema = my_cursor.fetchall()
         
+        pk_columns = [col[0] for col in columns_schema if col[3] in (b'PRI', 'PRI')]
+
         column_defs = []
         for col in columns_schema:
             col_name = col[0]
             col_type = col[1].decode('utf-8') if isinstance(col[1], bytearray) else col[1]
             pg_type = map_mysql_to_postgres_type(col_type)
             nullable = "NULL" if col[2] == 'YES' else "NOT NULL"
-            pk_constraint = ""
-            if col[3] in (b'PRI', 'PRI'):
-                pk_constraint = " PRIMARY KEY"
-            column_defs.append(f'"{col_name}" {pg_type} {nullable}{pk_constraint}')
+            column_defs.append(f'"{col_name}" {pg_type} {nullable}')
 
-        primary_key_column = None
-        pk_candidates = [col[0] for col in columns_schema if col[3] in (b'PRI', 'PRI')]
-        if len(pk_candidates) == 1:
-            primary_key_column = pk_candidates[0]
+        if pk_columns:
+            pk_cols_sql = '", "'.join(pk_columns)
+            column_defs.append(f'PRIMARY KEY ("{pk_cols_sql}")')
+
+        # Determine the primary key column for pagination (if single)
+        primary_key_column = pk_columns[0] if len(pk_columns) == 1 else None
 
         # --- Get All Index Info ---
         my_cursor.execute(f"SHOW INDEX FROM `{table_name}`")
@@ -287,7 +288,7 @@ def migrate_table(table_name, my_conn, pg_conn, chunk_size, recreate, truncate, 
                 sys.stdout.flush()
 
         else:
-            if len(pk_candidates) > 1:
+            if len(pk_columns) > 1:
                 print("Warning: Composite primary key detected. Falling back to less efficient OFFSET pagination.")
             else:
                 print("Warning: No single primary key found. Falling back to less efficient OFFSET pagination.")
